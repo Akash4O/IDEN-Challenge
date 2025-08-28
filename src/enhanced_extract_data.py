@@ -2,97 +2,311 @@ import json
 import os
 import sys
 import asyncio
+import warnings
+import time
+import gc
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
+@dataclass
+class ExtractorConfig:
+    """Configuration for the data extraction workflow."""
+    url: str
+    email: str
+    password: str
+    session_file: str = "session.json"
+    headless: bool = False
+    force_login: bool = False
+
+
 class DataExtractor:
-    def __init__(self, url: str, email: str, password: str, session_file: str = "session.json"):
-        """
-        Initialize the DataExtractor with the target URL and credentials.
-        
-        Args:
-            url: The URL of the application
-            email: Login email address
-            password: Login password
-            session_file: Path to the session storage file
-        """
-        self.url = url
-        self.username = email  # We'll keep the variable name the same for compatibility
-        self.password = password
-        self.session_file = session_file
-        
+    """High‑level orchestrator for challenge automation (sans submission).
+
+    Responsibilities:
+      1. Session reuse (storage_state load) & validation.
+      2. Authentication when session absent/invalid.
+      3. Wizard navigation to reach product listing.
+      4. Product data extraction incl. pagination / lazy loading.
+      5. JSON export of extracted products.
+      6. Session enrichment & persistence (cookies, localStorage, token heuristics).
+    """
+
+    def __init__(self, url: str, email: str, password: str, session_file: str = "session.json", headless: bool = False, force_login: bool = False, config: Optional[ExtractorConfig] = None) -> None:
+        # Backwards-compatible signature while supporting dataclass config injection.
+        if config is not None:
+            self.url = config.url
+            self.username = config.email
+            self.password = config.password
+            self.session_file = config.session_file
+            self.headless = config.headless
+            self.force_login = config.force_login
+        else:
+            self.url = url
+            self.username = email
+            self.password = password
+            self.session_file = session_file
+            self.headless = headless
+            self.force_login = force_login
+
+        # Derived paths
+        self._raw_state_file = os.path.splitext(self.session_file)[0] + "_raw.json"
+
+        # Runtime state containers
+        self._playwright = None            # playwright instance for explicit shutdown
+        self._loaded_session_meta = None   # metadata from stored session
+        self._loaded_tokens = None         # previously extracted token-like values
+        self._tokens: Dict[str, str] = {}  # tokens captured in current run
+
+    # -------- Session Management Helpers --------
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _wrap_storage_state(self, storage_state: dict) -> dict:
+        """Wrap raw playwright storage_state with metadata for robustness."""
+        return {
+            "version": 1,
+            "created_at": self._loaded_session_meta.get("created_at") if self._loaded_session_meta else self._now_iso(),
+            "last_verified": self._now_iso(),
+            "username": self.username,
+            "storage_state": storage_state,
+        }
+
+    def _parse_session_file(self) -> dict | None:
+        if not os.path.exists(self.session_file) or os.path.getsize(self.session_file) < 5:
+            # Fallback: try raw playwright state file
+            if os.path.exists(self._raw_state_file) and os.path.getsize(self._raw_state_file) > 5:
+                try:
+                    with open(self._raw_state_file, "r", encoding="utf-8") as rf:
+                        raw = json.load(rf)
+                        if isinstance(raw, dict) and (raw.get("cookies") or raw.get("origins")):
+                            print("Loaded raw playwright state fallback")
+                            return raw
+                except Exception as e:
+                    print(f"Raw state fallback parse error: {e}")
+            return None
+        try:
+            with open(self.session_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Extract any stored tokens
+            if isinstance(data, dict) and data.get("tokens") and isinstance(data.get("tokens"), dict):
+                self._loaded_tokens = data.get("tokens")
+            # Legacy raw format (cookies/origins at top-level)
+            if isinstance(data, dict) and ("cookies" in data or "origins" in data):
+                self._loaded_session_meta = {"created_at": self._now_iso(), "last_verified": self._now_iso()}
+                return data
+            # Wrapped format
+            if isinstance(data, dict) and "storage_state" in data:
+                self._loaded_session_meta = {k: data.get(k) for k in ("created_at", "last_verified", "username") if k in data}
+                return data.get("storage_state")
+        except Exception as e:
+            print(f"Session parse error: {e}")
+        return None
+
+    def _session_age_minutes(self) -> float | None:
+        if not self._loaded_session_meta or not self._loaded_session_meta.get("last_verified"):
+            return None
+        try:
+            ts = datetime.fromisoformat(self._loaded_session_meta["last_verified"])
+            return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+        except Exception:
+            return None
+
+    async def _save_session(self, context: BrowserContext, label: str = "", page: Optional[Page] = None) -> None:
+        """Persist session; if cookies/origins absent attempt to build origins from localStorage."""
+        try:
+            storage = await context.storage_state()
+
+            # Fallback: capture cookies manually if missing
+            if not storage.get("cookies"):
+                try:
+                    cookies = await context.cookies()
+                    if cookies:
+                        storage["cookies"] = cookies
+                except Exception:
+                    pass
+
+            # Fallback: synthesize origins from localStorage if page provided
+            if (not storage.get("origins")) and page is not None:
+                try:
+                    local_items = await page.evaluate("""() => { const o={}; for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i); o[k]=localStorage.getItem(k);} return o; }""")
+                    if local_items and isinstance(local_items, dict) and len(local_items) > 0:
+                        origin = page.url
+                        parsed = urlparse(origin)
+                        origin_base = f"{parsed.scheme}://{parsed.netloc}"
+                        storage["origins"] = [{
+                            "origin": origin_base,
+                            "localStorage": [{"name": k, "value": v} for k, v in local_items.items()]
+                        }]
+                        print(f"Captured {len(local_items)} localStorage entries for origin {origin_base}")
+                except Exception as e:
+                    print(f"LocalStorage capture failed: {e}")
+
+            # Decide if we persist even if empty: we persist if any cookies OR origins OR we haven't saved before
+            if storage.get("cookies") or storage.get("origins"):
+                wrapped = self._wrap_storage_state(storage)
+                if self._tokens:
+                    wrapped["tokens"] = self._tokens
+                with open(self.session_file, "w", encoding="utf-8") as f:
+                    json.dump(wrapped, f, indent=2)
+                # Also persist plain playwright-compatible state for fallback reuse
+                try:
+                    with open(self._raw_state_file, "w", encoding="utf-8") as rf:
+                        json.dump(storage, rf, indent=2)
+                except Exception as e:
+                    print(f"Raw state save error: {e}")
+                age = self._session_age_minutes()
+                age_txt = f" (age {age:.1f}m)" if age is not None else ""
+                print(f"Session saved{age_txt} {('['+label+']') if label else ''} -> {self.session_file}  cookies={len(storage.get('cookies', []))} origins={len(storage.get('origins', []))}")
+            else:
+                # Persist minimal wrapper anyway so next run can attempt reuse and recapture
+                wrapped = self._wrap_storage_state(storage)
+                if self._tokens:
+                    wrapped["tokens"] = self._tokens
+                with open(self.session_file, "w", encoding="utf-8") as f:
+                    json.dump(wrapped, f, indent=2)
+                # Write empty raw file for visibility
+                try:
+                    with open(self._raw_state_file, "w", encoding="utf-8") as rf:
+                        json.dump(storage, rf, indent=2)
+                except Exception:
+                    pass
+                print("Session wrapper saved (no cookies/origins yet) – will attempt enrichment next run.")
+        except Exception as e:
+            print(f"Session save error: {e}")
+
+    async def _extract_tokens(self, page: Page) -> Dict[str, str]:
+        """Heuristically extract token-like globals/localStorage values for later injection."""
+        candidates: Dict[str, str] = {}
+        try:
+            # Collect from localStorage first
+            ls = await page.evaluate("""() => { const o={}; for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i); o[k]=localStorage.getItem(k);} return o; }""")
+            if isinstance(ls, dict):
+                for k,v in ls.items():
+                    if isinstance(v, str) and len(v) > 8 and any(tok in k.lower() for tok in ["token","auth","jwt","bearer","session"]):
+                        candidates[k] = v
+            # Inspect selected window properties (avoid huge enumeration; pick known patterns)
+            win_props = await page.evaluate("""() => { const out={}; const keys = Object.keys(window).filter(k=>k === k.toUpperCase() || k.startsWith('__')); keys.slice(0,150).forEach(k=>{ try { const val = window[k]; if (typeof val === 'string' && val.length>15) out[k]=val; } catch(e){} }); return out; }""")
+            if isinstance(win_props, dict):
+                for k,v in win_props.items():
+                    if any(tok in k.lower() for tok in ["token","auth","jwt"]):
+                        candidates[k]=v
+        except Exception as e:
+            print(f"Token extraction error: {e}")
+        if candidates:
+            print(f"Extracted {len(candidates)} token-like values.")
+        self._tokens.update(candidates)
+        return candidates
+
+    async def _is_session_valid(self, page: Page) -> bool:
+        try:
+            indicators = [
+                "text=Submit Script",
+                "text=Submit Solution",
+                "text=Product Dashboard",
+                f"text={self.username}" if self.username else None,
+            ]
+            for sel in filter(None, indicators):
+                try:
+                    if await page.is_visible(sel, timeout=1200):
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    async def _poll_for_storage(self, page: Page, timeout_ms: int = 8000, interval_ms: int = 500) -> dict:
+        """Poll for appearance of localStorage/sessionStorage keys (esp. auth tokens)."""
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+        captured = {"local": {}, "session": {}}
+        patterns = ["token", "auth", "session", "jwt"]
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                data = await page.evaluate("""() => {
+                    const collect = (store) => { const o={}; for(let i=0;i<store.length;i++){const k=store.key(i); o[k]=store.getItem(k);} return o; };
+                    return {local: collect(localStorage), session: collect(sessionStorage)};
+                }""")
+                captured = data or captured
+                if any(any(p in k.lower() for p in patterns) for k in list(captured.get('local', {}).keys())+list(captured.get('session', {}).keys())):
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(interval_ms/1000)
+        return captured
+
     async def init_browser(self) -> tuple[Browser, BrowserContext, Page]:
-        """Initialize browser and create a new context and page"""
-        playwright = await async_playwright().start()
-        
-        # Launch with persistent context to better maintain sessions across runs
-        browser = await playwright.chromium.launch(headless=False)
-        
-        # Check if we have a saved session
+        # Store playwright instance for explicit shutdown to reduce ResourceWarnings on Windows
+        self._playwright = await async_playwright().start()
+        browser = await self._playwright.chromium.launch(headless=self.headless)
+
         context_options = {
             "accept_downloads": True,
             "ignore_https_errors": True,
-            # Add more specific options for the context
             "viewport": {"width": 1280, "height": 800}
         }
-        
-        if os.path.exists(self.session_file) and os.path.getsize(self.session_file) > 10:  # Check if file has content
-            try:
-                with open(self.session_file, "r") as f:
-                    storage_state = json.load(f)
-                    if storage_state and (storage_state.get("cookies") or storage_state.get("origins")):
-                        context_options["storage_state"] = storage_state
-                        print("Using existing session from:", self.session_file)
-                    else:
-                        print("Session file exists but has no valid session data")
-            except Exception as e:
-                print(f"Error loading session file: {e}")
+        if not self.force_login:
+            storage_state = self._parse_session_file()
+            if storage_state and (storage_state.get("cookies") or storage_state.get("origins")):
+                context_options["storage_state"] = storage_state
+                age = self._session_age_minutes()
+                age_txt = f" (age {age:.1f}m since last_verified)" if age is not None else ""
+                print(f"Using existing session from: {self.session_file}{age_txt}")
+            else:
+                if storage_state is None:
+                    print("No valid session file found or force login requested")
+                else:
+                    print("Session file present but empty/unusable; will login anew (will enrich after login)")
         else:
-            print("No valid session file found or file is empty")
-        
-        # Create a new context with the storage state if it exists
+            print("Force login enabled; ignoring any stored session")
+
         context = await browser.new_context(**context_options)
-        
-        # Set permission to allow notifications and location access which can help with session management
+        # Inject previously captured tokens before any page scripts run
+        if self._loaded_tokens:
+            try:
+                injection_lines = []
+                for k,v in self._loaded_tokens.items():
+                    # Basic sanitization
+                    k_s = k.replace("'", "")
+                    v_s = (v if isinstance(v,str) else json.dumps(v)).replace("'", "")
+                    injection_lines.append(f"window['{k_s}']='{v_s}'; try{{localStorage.setItem('{k_s}','{v_s}')}}catch(e){{}};")
+                script = "(() => {" + "".join(injection_lines) + "})();"
+                await context.add_init_script(script)
+                print(f"Injected {len(self._loaded_tokens)} stored token globals before navigation.")
+            except Exception as e:
+                print(f"Token injection failed: {e}")
         await context.grant_permissions(['notifications', 'geolocation'])
-        
-        # Create a new page
         page = await context.new_page()
-        
         return browser, context, page
         
-    async def login(self, page: Page) -> bool:
-        """
-        Log in to the application if needed.
-        
-        Args:
-            page: Playwright page object
-            
-        Returns:
-            bool: True if login successful, False otherwise
+    async def login(self, page: Page, context: BrowserContext) -> bool:
+        """Login if not already authenticated; persist session on success.
+
+        Enhancements:
+          * Skips login when a valid session already navigates to dashboard
+          * Force login option bypasses stored session
+          * Saves session with metadata after successful authentication/validation
         """
         try:
             await page.goto(self.url)
             print(f"Navigated to {self.url}")
-            
-            # Wait for the page to stabilize
             await page.wait_for_load_state("networkidle")
             
-            # Check if we're already logged in by looking for an element that's only visible when logged in
-            # Try multiple possible indicators
-            try:
-                is_logged_in = await page.is_visible("text=Submit Script", timeout=3000) or \
-                               await page.is_visible("text=Data Extraction", timeout=1000) or \
-                               await page.is_visible("nav >> text=Submit Script", timeout=1000)
-                
-                if is_logged_in:
-                    print("Already logged in.")
+            if not self.force_login:
+                # Validate existing session
+                if await self._is_session_valid(page):
+                    print("Session validated – skipping login form.")
+                    await self._extract_tokens(page)
+                    await self._save_session(context, label="validated", page=page)
                     return True
-            except Exception:
-                print("Not logged in yet.")
+                else:
+                    print("Stored session invalid or expired; performing login.")
             
             print("Attempting to log in...")
             
-            # Try different selectors for email input
             email_selectors = [
                 'input[name="email"]', 
                 'input[type="email"]',
@@ -111,13 +325,11 @@ class DataExtractor:
                     continue
             else:
                 print("Warning: Could not find email field with standard selectors")
-                # Try a more aggressive approach - locate any visible input and fill it
                 inputs = await page.query_selector_all('input:visible')
                 if len(inputs) >= 1:
                     await inputs[0].fill(self.username)
                     print("Filled first visible input field")
             
-            # Try different selectors for password input
             password_selectors = [
                 'input[name="password"]',
                 'input[type="password"]',
@@ -136,18 +348,15 @@ class DataExtractor:
                     continue
             else:
                 print("Warning: Could not find password field with standard selectors")
-                # Try a more aggressive approach - locate any visible input of type password
                 try:
                     await page.fill('input[type="password"]', self.password)
                     print("Filled password field using type selector")
                 except Exception:
-                    # If we have more than one input, assume second is password
                     inputs = await page.query_selector_all('input:visible')
                     if len(inputs) >= 2:
                         await inputs[1].fill(self.password)
                         print("Filled second visible input field as password")
             
-            # Try different selectors for login button
             button_selectors = [
                 'button[type="submit"]',
                 'button:has-text("Login")',
@@ -168,93 +377,37 @@ class DataExtractor:
                     continue
             else:
                 print("Warning: Could not find login button with standard selectors")
-                # Try a more aggressive approach - click any button
                 buttons = await page.query_selector_all('button')
                 if buttons:
                     await buttons[0].click()
                     print("Clicked first button found")
             
-            # Wait for navigation to complete
             await page.wait_for_load_state("networkidle", timeout=15000)
+            await asyncio.sleep(2)
             
-            # Check if login was successful by looking for dashboard elements
-            await asyncio.sleep(2)  # Give the page a moment to stabilize
+            # Post-submit check loop: allow some time for redirect
+            indicators = ["text=Submit Script", "text=Submit Solution", "text=Product Dashboard"]
+            for _ in range(6):  # up to ~6 * 1s = 6s additional polling
+                if await self._is_session_valid(page):
+                    print("Login successful (dashboard indicators present). Waiting for storage tokens...")
+                    # Poll for local/session storage enrichment before first save
+                    await self._poll_for_storage(page, timeout_ms=7000)
+                    await self._extract_tokens(page)
+                    await self._save_session(context, label="login", page=page)
+                    return True
+                await asyncio.sleep(1)
             
-            login_indicators = [
-                "text=Submit Script",
-                "text=Data Extraction", 
-                "nav >> text=Submit Script",
-                ".dashboard-container",
-                "#user-profile"
-            ]
-            
-            for indicator in login_indicators:
-                try:
-                    if await page.is_visible(indicator, timeout=2000):
-                        print(f"Login successful! Found indicator: {indicator}")
-                        
-                        # Ensure we have cookies and storage before saving
-                        await asyncio.sleep(2)  # Wait a bit to ensure all cookies are set
-                        
-                        # Get the storage state with both cookies and local storage
-                        storage = await page.context.storage_state()
-                        
-                        # Check if we have meaningful session data
-                        if not storage.get("cookies") and not storage.get("origins"):
-                            print("Warning: No cookies or storage data found in the session")
-                            
-                            # Force a more comprehensive storage capture
-                            cookies = await page.context.cookies()
-                            if cookies:
-                                storage["cookies"] = cookies
-                                print(f"Captured {len(cookies)} cookies manually")
-                        
-                        # Save the enhanced session
-                        with open(self.session_file, "w") as f:
-                            json.dump(storage, f, indent=2)
-                        
-                        print(f"Session saved to {self.session_file} with {len(storage.get('cookies', []))} cookies")
-                        return True
-                except Exception as e:
-                    print(f"Error checking login indicator {indicator}: {e}")
-                    continue
-            
-            print("Warning: Couldn't verify successful login. Proceeding anyway.")
-            
-            # Try to save session anyway in case login was successful
-            try:
-                await asyncio.sleep(2)  # Give extra time for cookies to be set
-                storage = await page.context.storage_state()
-                
-                # Check if we have any cookies before saving
-                if storage.get("cookies") or storage.get("origins"):
-                    with open(self.session_file, "w") as f:
-                        json.dump(storage, f, indent=2)
-                    print(f"Session saved despite login verification failure")
-                else:
-                    print("No session data available to save")
-            except Exception as e:
-                print(f"Error saving session: {e}")
-            
-            return True
+            print("Login verification failed – session may not be established.")
+            return False
             
         except Exception as e:
             print(f"Login failed: {e}")
             return False
             
     async def navigate_wizard(self, page: Page) -> bool:
-        """
-        Navigate through the 4-step wizard to reach the product table.
-        
-        Args:
-            page: Playwright page object
-            
-        Returns:
-            bool: True if navigation was successful, False otherwise
-        """
+        """Navigate 4‑step wizard path (Data Source -> Category -> View Type -> View Products)."""
         try:
-            
-            # Step 1: Click the "Launch Challenge" button on the instructions page
+            # Some flows present a straight "Launch Challenge" button, others land directly on wizard.
             launch_challenge_selectors = [
                 "text=Launch Challenge",
                 "button:has-text('Launch Challenge')",
@@ -282,7 +435,7 @@ class DataExtractor:
             await page.wait_for_load_state("networkidle", timeout=10000)
             await asyncio.sleep(1)
             
-            # Step 1: Select "Local Database" button in the first section
+            # Step 1: Select data source (Local Database)
             print("Step 1: Selecting Local Database as data source")
             local_database_selectors = [
                 "text=Local Database", 
@@ -303,8 +456,8 @@ class DataExtractor:
                     continue
 
             
-            # Click on "All Products" option
-            print("Selecting 'All Products' option")
+            # Step 2: Choose category (All Products)
+            print("Selecting 'All Products' option (Category)")
             all_products_selectors = [
                 "text=All Products",
                 "button:has-text('All Products')",
@@ -324,8 +477,8 @@ class DataExtractor:
                     continue
 
             
-            # Step 2: Select "Table View" in the second section
-            print("Step 2: Selecting Table View")
+            # Step 3: Select view type (Table View)
+            print("Step 3: Selecting Table View")
             table_view_selectors = [
                 "text=Table View",
                 "button:has-text('Table View')",
@@ -345,8 +498,8 @@ class DataExtractor:
                     continue
 
             
-            # Step 3: Click on "View Products" in the third section
-            print("Step 3: Clicking View Products")
+            # Step 4: Final step -> View Products
+            print("Step 4: Clicking View Products")
             view_products_selectors = [
                 "text=View Products",
                 "button:has-text('View Products')",
@@ -354,6 +507,14 @@ class DataExtractor:
                 "button >> text=View Products",
                 "//button[contains(text(), 'View Products')]",
                 "[role='button']:has-text('View Products')"
+            ]
+
+            # Fallback generic next buttons used in some variants of the wizard.
+            next_button_selectors = [
+                "button:has-text('Next')",
+                "text=Next",
+                "button[aria-label='Next']",
+                "[role='button']:has-text('Next')"
             ]
             
             # Try multiple strategies to click the View Products button
@@ -437,6 +598,30 @@ class DataExtractor:
                 except Exception as e:
                     print(f"Error during aggressive button search: {e}")
             
+            # If still not found, try a sequence of generic Next buttons (simulate explicit Next at each of 4 steps)
+            if not button_found:
+                try:
+                    for i in range(4):  # up to 4 wizard steps
+                        progressed = False
+                        for sel in next_button_selectors:
+                            try:
+                                if await page.is_visible(sel, timeout=1500):
+                                    await page.click(sel)
+                                    print(f"Clicked generic Next button (step {i+1}) using {sel}")
+                                    await page.wait_for_load_state("networkidle", timeout=8000)
+                                    progressed = True
+                                    break
+                            except Exception:
+                                continue
+                        if not progressed:
+                            break
+                        # After each potential Next click, check for table
+                        if await page.locator("table").first.is_visible(timeout=1500):
+                            button_found = True
+                            break
+                except Exception:
+                    pass
+
             # If still not found, try refreshing the page as a last resort
             if not button_found:
                 print("View Products button click may have failed. Trying page refresh...")
@@ -494,6 +679,13 @@ class DataExtractor:
             
             if table_found:
                 print("Successfully navigated to the product table.")
+                # Enrich & save session now that deeper page likely set tokens/localStorage
+                try:
+                    await self._poll_for_storage(page, timeout_ms=4000)
+                    await self._extract_tokens(page)
+                    await self._save_session(page.context, label="post-wizard", page=page)
+                except Exception:
+                    pass
                 return True
             else:
                 print("Warning: Couldn't verify the product table loaded. Will try to extract data anyway.")
@@ -507,20 +699,12 @@ class DataExtractor:
             return False
             
     async def extract_table_data(self, page: Page) -> list:
-        """
-        Extract all data from the product table, handling pagination if present.
-        
-        Args:
-            page: Playwright page object
-            
-        Returns:
-            list: List of dictionaries containing product data
-        """
+        """Extract all product rows, traversing pagination & lazy loading until exhausted."""
         all_products = []
+        collected_keys = set()  # Track product identity to avoid duplicates
+        total_expected = None  # Will hold total products if pattern detected
         
         try:
-            
-            # Wait longer to make sure the products table is fully loaded
             await asyncio.sleep(3)
             await page.wait_for_load_state("networkidle", timeout=15000)
             
@@ -542,10 +726,7 @@ class DataExtractor:
                         try:
                             await page.evaluate(f"""() => {{
                                 const element = document.querySelector('{selector}');
-                                if (element) {{
-                                    element.click();
-                                    return true;
-                                }}
+                                if (element) {{ element.click(); return true; }}
                                 return false;
                             }}""")
                         except Exception:
@@ -637,22 +818,15 @@ class DataExtractor:
                 print(f"No additional View Products buttons found: {e}")
 
             
-            # Try to extract product data directly using JavaScript
             print("Attempting direct data extraction...")
             
             try:
-                # Use JavaScript to find and extract structured data from the page
                 extracted_data = await page.evaluate("""() => {
-                    // Helper function to extract text from an element
                     const getText = (el) => el ? el.textContent.trim() : '';
-                    
-                    // Try to find product data in various formats
                     let products = [];
                     
-                    // Approach 1: Look for standard HTML tables
                     const tables = document.querySelectorAll('table');
                     if (tables.length > 0) {
-                        // Get the largest table (likely the product table)
                         let largestTable = tables[0];
                         let maxRows = 0;
                         
@@ -664,7 +838,6 @@ class DataExtractor:
                             }
                         });
                         
-                        // Extract headers
                         const headerRow = largestTable.querySelector('thead tr') || 
                                          largestTable.querySelector('tr:first-child');
                         
@@ -674,14 +847,12 @@ class DataExtractor:
                             headerCells.forEach(cell => headers.push(getText(cell)));
                         }
                         
-                        // If no headers found, use generic ones
                         if (headers.length === 0) {
                             const firstRow = largestTable.querySelector('tr');
                             const cellCount = firstRow ? firstRow.querySelectorAll('td, th').length : 0;
                             headers = Array(cellCount).fill(0).map((_, i) => `Column${i+1}`);
                         }
                         
-                        // Extract rows
                         const rows = largestTable.querySelectorAll('tbody tr, tr:not(:first-child)');
                         rows.forEach(row => {
                             const cells = row.querySelectorAll('td');
@@ -693,7 +864,6 @@ class DataExtractor:
                                     }
                                 });
                                 
-                                // Only add non-empty products
                                 if (Object.values(product).some(v => v)) {
                                     products.push(product);
                                 }
@@ -802,7 +972,12 @@ class DataExtractor:
                 
                 if extracted_data and len(extracted_data) > 0:
                     print(f"Successfully extracted {len(extracted_data)} products directly with JavaScript!")
-                    all_products = extracted_data
+                    # Initial page data
+                    for row in extracted_data:
+                        key = row.get('Item #') or row.get('Item') or row.get('Name') or json.dumps(row, sort_keys=True)
+                        if key not in collected_keys:
+                            collected_keys.add(key)
+                            all_products.append(row)
             except Exception as e:
                 print(f"Direct extraction failed: {e}")
                 # Create a synthetic product since extraction failed
@@ -825,7 +1000,169 @@ class DataExtractor:
                     }
                 ]
             
-            print(f"Extracted data for {len(all_products)} products.")
+            # Pagination & lazy-loading handling
+            try:
+                total_text = await page.inner_text("body")
+                total_match = re.search(r"Showing\s+(\d+)\s+of\s+(\d+)\s+products", total_text, re.IGNORECASE)
+                if total_match:
+                    shown, total_expected = int(total_match.group(1)), int(total_match.group(2))
+                    print(f"Detected product count text: showing {shown} of {total_expected}")
+                
+                # Helper to extract current page rows again (for subsequent pages) via JS
+                async def extract_current_page():
+                    data = await page.evaluate("""() => {
+                        const getText = (el) => el ? el.textContent.trim() : '';
+                        let products = [];
+                        const table = document.querySelector('table');
+                        if (!table) return products;
+                        let headers = [];
+                        const headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
+                        if (headerRow) {
+                            headerRow.querySelectorAll('th,td').forEach(c => headers.push(getText(c)));
+                        }
+                        if (headers.length === 0) {
+                            const firstRow = table.querySelector('tr');
+                            const cellCount = firstRow ? firstRow.querySelectorAll('td,th').length : 0;
+                            headers = Array(cellCount).fill(0).map((_,i)=>`Column${i+1}`);
+                        }
+                        const rows = table.querySelectorAll('tbody tr, tr:not(:first-child)');
+                        rows.forEach(r => {
+                            const cells = r.querySelectorAll('td');
+                            if (!cells.length) return;
+                            let obj = {};
+                            cells.forEach((cell,i)=>{ if (i < headers.length) obj[headers[i]||`Column${i+1}`] = getText(cell); });
+                            if (Object.values(obj).some(v=>v)) products.push(obj);
+                        });
+                        return products;
+                    }""")
+                    return data or []
+                
+                # Strategies: pagination buttons, next arrow, load more, infinite scroll
+                pagination_attempts = 0
+                max_pages = 200  # safety cap
+                while True:
+                    # Refresh count indicator after each cycle
+                    try:
+                        ttext = await page.inner_text("body")
+                        m = re.search(r"Showing\s+(\d+)\s+of\s+(\d+)\s+products", ttext, re.IGNORECASE)
+                        if m:
+                            shown_now, total_now = int(m.group(1)), int(m.group(2))
+                            if total_expected is None:
+                                total_expected = total_now
+                            if shown_now >= total_now:
+                                # We appear to have loaded all rows present in DOM; extract again and stop
+                                new_rows = await extract_current_page()
+                                for row in new_rows:
+                                    key = row.get('Item #') or row.get('Item') or row.get('Name') or json.dumps(row, sort_keys=True)
+                                    if key not in collected_keys:
+                                        collected_keys.add(key)
+                                        all_products.append(row)
+                                break
+                    except Exception:
+                        pass
+                    if total_expected is not None and len(all_products) >= total_expected:
+                        break
+                    pagination_attempts += 1
+                    if pagination_attempts > max_pages:
+                        print("Reached max pagination attempts. Stopping.")
+                        break
+                    progressed = False
+                    next_selectors = [
+                        "button:has-text('Next')",
+                        "text=Next",
+                        "[aria-label='Next']",
+                        ".pagination-next",
+                        "button:has-text('>')",
+                        "a:has-text('Next')"
+                    ]
+                    for sel in next_selectors:
+                        try:
+                            if await page.is_enabled(sel, timeout=800) and await page.is_visible(sel, timeout=800):
+                                # Heuristic: if disabled or has aria-disabled true skip
+                                attr = await page.get_attribute(sel, 'disabled')
+                                aria = await page.get_attribute(sel, 'aria-disabled')
+                                if attr is not None or (aria and aria.lower() == 'true'):
+                                    continue
+                                await page.click(sel)
+                                print(f"Clicked pagination control: {sel}")
+                                await page.wait_for_load_state("networkidle", timeout=10000)
+                                await asyncio.sleep(0.8)
+                                new_rows = await extract_current_page()
+                                new_added = 0
+                                for row in new_rows:
+                                    key = row.get('Item #') or row.get('Item') or row.get('Name') or json.dumps(row, sort_keys=True)
+                                    if key not in collected_keys:
+                                        collected_keys.add(key)
+                                        all_products.append(row)
+                                        new_added += 1
+                                print(f"Added {new_added} new rows. Total now {len(all_products)}")
+                                progressed = new_added > 0
+                                break
+                        except Exception:
+                            continue
+                    if progressed:
+                        continue
+                    # Try Load More button pattern
+                    load_more_selectors = [
+                        "button:has-text('Load More')",
+                        "text=Load More",
+                        "button:has-text('Show More')"
+                    ]
+                    load_clicked = False
+                    for sel in load_more_selectors:
+                        try:
+                            if await page.is_visible(sel, timeout=600):
+                                await page.click(sel)
+                                print(f"Clicked load more control: {sel}")
+                                await page.wait_for_load_state("networkidle", timeout=10000)
+                                await asyncio.sleep(1)
+                                new_rows = await extract_current_page()
+                                new_added = 0
+                                for row in new_rows:
+                                    key = row.get('Item #') or row.get('Item') or row.get('Name') or json.dumps(row, sort_keys=True)
+                                    if key not in collected_keys:
+                                        collected_keys.add(key)
+                                        all_products.append(row)
+                                        new_added += 1
+                                print(f"Added {new_added} new rows after load more. Total {len(all_products)}")
+                                load_clicked = True
+                                break
+                        except Exception:
+                            continue
+                    if load_clicked:
+                        continue
+                    # Infinite scroll fallback
+                    previous_count = len(all_products)
+                    try:
+                        for _ in range(5):
+                            await page.mouse.wheel(0, 1600)
+                            await asyncio.sleep(0.4)
+                        # Re-extract
+                        new_rows = await extract_current_page()
+                        for row in new_rows:
+                            key = row.get('Item #') or row.get('Item') or row.get('Name') or json.dumps(row, sort_keys=True)
+                            if key not in collected_keys:
+                                collected_keys.add(key)
+                                all_products.append(row)
+                        if len(all_products) > previous_count:
+                            print(f"Infinite scroll loaded {len(all_products)-previous_count} new rows (total {len(all_products)}).")
+                            if total_expected and len(all_products) >= total_expected:
+                                break
+                            # Continue another loop iteration to attempt further loading
+                            continue
+                    except Exception:
+                        pass
+                    # No progress by any method -> stop
+                    break
+            except Exception as e:
+                print(f"Pagination handling error (non-fatal): {e}")
+
+            # Hard trim if we collected more than expected (defensive)
+            if total_expected and len(all_products) > total_expected:
+                all_products = all_products[:total_expected]
+                print(f"Trimmed product list to expected total {total_expected}")
+
+            print(f"Extracted data for {len(all_products)} products (after pagination attempts).")
             return all_products
             
         except Exception as e:
@@ -839,16 +1176,6 @@ class DataExtractor:
             }]
             
     async def save_data_to_json(self, data: list, output_file: str = "products.json") -> bool:
-        """
-        Save the extracted data to a JSON file.
-        
-        Args:
-            data: List of product dictionaries
-            output_file: Path to the output JSON file
-            
-        Returns:
-            bool: True if save was successful, False otherwise
-        """
         try:
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -859,48 +1186,37 @@ class DataExtractor:
             return False
             
     async def run(self) -> bool:
-        """
-        Execute the full data extraction process.
-        
-        Returns:
-            bool: True if the entire process was successful, False otherwise
-        """
+        """End-to-end execution covering all mission objectives."""
         browser = None
         context = None
         page = None
         
         try:
             browser, context, page = await self.init_browser()
-            
-            # Login
-            if not await self.login(page):
+
+            if not await self.login(page, context):
                 return False
                 
-            # Navigate to product table
             if not await self.navigate_wizard(page):
                 return False
                 
-            # Extract data
             products = await self.extract_table_data(page)
             
             if not products:
                 print("No products found.")
                 return False
                 
-            # Save data
             if not await self.save_data_to_json(products):
                 return False
             
-            # Save session one more time to ensure we capture any cookies set during navigation
+            # Final enrichment save attempt with full page state
             try:
-                storage = await context.storage_state()
-                if storage.get("cookies") or storage.get("origins"):
-                    with open(self.session_file, "w") as f:
-                        json.dump(storage, f, indent=2)
-                    print(f"Final session state saved with {len(storage.get('cookies', []))} cookies")
+                await self._poll_for_storage(page, timeout_ms=5000)
+                await self._extract_tokens(page)
+                await self._save_session(context, label="final", page=page)
             except Exception as e:
-                print(f"Error saving final session: {e}")
-                
+                print(f"Error saving final/enriched session: {e}")
+
             return True
             
         except Exception as e:
@@ -916,6 +1232,9 @@ class DataExtractor:
                     await context.close()
                 if browser:
                     await browser.close()
+                # Explicitly stop playwright to avoid lingering transports
+                if hasattr(self, '_playwright') and self._playwright:
+                    await self._playwright.stop()
             except Exception as e:
                 print(f"Error during cleanup: {e}")
             
@@ -925,41 +1244,21 @@ class DataExtractor:
 
 
 async def main():
-    # Suppress all ResourceWarnings on Windows (especially for asyncio pipes)
-    import warnings
     warnings.filterwarnings("ignore", category=ResourceWarning)
-    warnings.filterwarnings("ignore", message="unclosed.*<asyncio.sslproto._SSLProtocolTransport.*>")
-    warnings.filterwarnings("ignore", message="unclosed transport.*")
-    warnings.filterwarnings("ignore", message="unclosed.*<_ProactorBasePipeTransport.*")
-    warnings.filterwarnings("ignore", message="unclosed.*<BaseSubprocessTransport.*")
-    warnings.filterwarnings("ignore", message="I/O operation on closed pipe")
     
-    # Replace with actual URL and credentials
-    url = "https://hiring.idenhq.com/"  # Replace with the actual URL
-    email = "akashkolde1320@gmail.com"  # Email address for login
-    password = "q1JF4KZf"  # Replace with the actual password
+    url = "https://hiring.idenhq.com/"
+    email = "akashkolde1320@gmail.com"
+    password = "q1JF4KZf"
     
     extractor = DataExtractor(url, email, password)
     await extractor.run()
 
 
 if __name__ == "__main__":
-    # Special handling for Python 3.12 on Windows with Playwright
-    # Python 3.12 has changes in asyncio implementation that can cause issues with Playwright
-    
-    # Suppress all ResourceWarnings at a global level (more comprehensive)
-    import warnings
-    warnings.filterwarnings("ignore", category=ResourceWarning)
-    
     try:
-        # Windows needs specific event loop policy for better compatibility
-        # with asyncio-based libraries like Playwright
         if sys.platform == 'win32':
-            # Python 3.8+ with Windows - set ProactorEventLoop policy
-            # (This is critical for Python 3.12 on Windows)
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         
-        # Use the simple approach which works well with proper policy set
         asyncio.run(main())
         
     except KeyboardInterrupt:
@@ -967,10 +1266,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error during execution: {e}")
     finally:
-        # Force cleanup to help with resource management
-        import gc
         gc.collect()
-        
-        # Sleep briefly to allow asyncio internal cleanup
-        import time
         time.sleep(0.1)
