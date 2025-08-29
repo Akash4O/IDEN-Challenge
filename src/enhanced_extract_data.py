@@ -1186,7 +1186,6 @@ class DataExtractor:
             return False
             
     async def run(self) -> bool:
-        """End-to-end execution covering all mission objectives."""
         browser = None
         context = None
         page = None
@@ -1209,7 +1208,6 @@ class DataExtractor:
             if not await self.save_data_to_json(products):
                 return False
             
-            # Final enrichment save attempt with full page state
             try:
                 await self._poll_for_storage(page, timeout_ms=5000)
                 await self._extract_tokens(page)
@@ -1222,9 +1220,7 @@ class DataExtractor:
         except Exception as e:
             print(f"Error during extraction: {e}")
             return False
-            
         finally:
-            # Clean up resources in proper order
             try:
                 if page:
                     await page.close()
@@ -1232,14 +1228,10 @@ class DataExtractor:
                     await context.close()
                 if browser:
                     await browser.close()
-                # Explicitly stop playwright to avoid lingering transports
-                if hasattr(self, '_playwright') and self._playwright:
+                if self._playwright:
                     await self._playwright.stop()
             except Exception as e:
                 print(f"Error during cleanup: {e}")
-            
-            # Force garbage collection to help clean up resources
-            import gc
             gc.collect()
 
 
